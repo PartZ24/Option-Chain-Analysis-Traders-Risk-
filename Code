@@ -1,3 +1,689 @@
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from scipy.stats import norm
+import json
+from typing import Dict, List, Tuple, Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.style.use("seaborn-v0_8")
+
+# =========================
+# Black–Scholes Greeks
+# =========================
+def bs_d1_d2(S, K, T, r, sigma):
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return np.nan, np.nan
+    d1 = (math.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return d1, d2
+
+def bs_delta(S, K, T, r, sigma, opt):
+    d1, _ = bs_d1_d2(S, K, T, r, sigma)
+    if np.isnan(d1): return np.nan
+    return norm.cdf(d1) if opt == "call" else norm.cdf(d1) - 1.0
+
+def bs_gamma(S, K, T, r, sigma):
+    d1, _ = bs_d1_d2(S, K, T, r, sigma)
+    if np.isnan(d1): return np.nan
+    return norm.pdf(d1) / (S * sigma * math.sqrt(T))
+
+def bs_vega(S, K, T, r, sigma):
+    d1, _ = bs_d1_d2(S, K, T, r, sigma)
+    if np.isnan(d1): return np.nan
+    return S * norm.pdf(d1) * math.sqrt(T)
+
+def bs_theta(S, K, T, r, sigma, opt):
+    d1, d2 = bs_d1_d2(S, K, T, r, sigma)
+    if np.isnan(d1): return np.nan
+    first = -(S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T))
+    if opt == "call":
+        second = r * K * math.exp(-r*T) * norm.cdf(d2)
+        return first - second
+    else:
+        second = r * K * math.exp(-r*T) * norm.cdf(-d2)
+        return first + second
+
+def bs_price(S, K, T, r, sigma, opt):
+    """Calculate Black-Scholes option price"""
+    d1, d2 = bs_d1_d2(S, K, T, r, sigma)
+    if np.isnan(d1): return np.nan
+    if opt == "call":
+        return S * norm.cdf(d1) - K * math.exp(-r*T) * norm.cdf(d2)
+    else:
+        return K * math.exp(-r*T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+# =========================
+# Live fetch via nsepython
+# =========================
+def fetch_nse_option_chain(symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[float]]:
+    """
+    Fetch live NSE option chain data
+    Returns: DataFrame with options data, spot price
+    """
+    try:
+        from nsepython import nse_optionchain_scrapper
+        data = nse_optionchain_scrapper(symbol)
+        records = data["records"]
+        underlying = records.get("underlyingValue") or records.get("underlying")
+
+        rows = []
+        for row in records["data"]:
+            strike = row["strikePrice"]
+            expiry = row["expiryDate"]
+
+            # Calls
+            c = row.get("CE")
+            if c:
+                rows.append({
+                    "option_type": "call",
+                    "expiry": expiry,
+                    "strike": strike,
+                    "oi": c.get("openInterest"),
+                    "change_oi": c.get("changeinOpenInterest"),
+                    "volume": c.get("totalTradedVolume"),
+                    "iv_pct": c.get("impliedVolatility"),
+                    "ltp": c.get("lastPrice"),
+                    "bid_qty": c.get("bidQty"),
+                    "bid": c.get("bidprice"),
+                    "ask": c.get("askPrice"),
+                    "ask_qty": c.get("askQty"),
+                })
+
+            # Puts
+            p = row.get("PE")
+            if p:
+                rows.append({
+                    "option_type": "put",
+                    "expiry": expiry,
+                    "strike": strike,
+                    "oi": p.get("openInterest"),
+                    "change_oi": p.get("changeinOpenInterest"),
+                    "volume": p.get("totalTradedVolume"),
+                    "iv_pct": p.get("impliedVolatility"),
+                    "ltp": p.get("lastPrice"),
+                    "bid_qty": p.get("bidQty"),
+                    "bid": p.get("bidprice"),
+                    "ask": p.get("askPrice"),
+                    "ask_qty": p.get("askQty"),
+                })
+
+        df = pd.DataFrame(rows)
+        df["expiry_dt"] = pd.to_datetime(df["expiry"], format="%d-%b-%Y")
+        df["iv"] = pd.to_numeric(df["iv_pct"], errors="coerce") / 100.0
+        df["oi"] = pd.to_numeric(df["oi"], errors="coerce")
+        df["change_oi"] = pd.to_numeric(df["change_oi"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["ltp"] = pd.to_numeric(df["ltp"], errors="coerce")
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+        df = df.dropna(subset=["strike", "expiry_dt"])
+
+        return df, float(underlying)
+    except Exception as e:
+        print(f"❌ Error fetching live data: {e}")
+        print("Make sure nsepython is installed: pip install nsepython")
+        return None, None
+
+# =========================
+# CSV ingestion (NSE download)
+# =========================
+def load_nse_option_chain_csv(file_path: str) -> pd.DataFrame:
+    """
+    Load NSE option chain from CSV file
+    Handles various NSE CSV formats automatically
+    """
+    try:
+        # Read the file by skipping the first two header rows and without assuming a header row in the data.
+        raw = pd.read_csv('/content/option-chain-ED-NIFTY-06-Jan-2026.csv')
+
+        # Define expected standard columns for NSE option chain data (21 columns)
+        standard_columns = [
+            "CALL_OI", "CALL_CHNG_OI", "CALL_VOLUME", "CALL_IV", "CALL_LTP", "CALL_CHNG",
+            "CALL_BID_QTY", "CALL_BID", "CALL_ASK", "CALL_ASK_QTY",
+            "STRIKE",
+            "PUT_BID_QTY", "PUT_BID", "PUT_ASK", "PUT_ASK_QTY", "PUT_CHNG", "PUT_LTP", "PUT_IV",
+            "PUT_VOLUME", "PUT_CHNG_OI", "PUT_OI"
+        ]
+
+        # Check actual number of columns read
+        num_cols = len(raw.columns)
+        if num_cols < len(standard_columns):
+            raise ValueError(f"CSV has too few columns. Expected at least {len(standard_columns)}, got {num_cols}")
+
+        # Assign standard columns and dynamically add 'EXTRA' for any additional columns
+        columns_to_assign = standard_columns + [f"EXTRA_{i+1}" for i in range(num_cols - len(standard_columns))]
+        raw.columns = columns_to_assign
+
+        # Clean and convert numeric columns
+        for col in standard_columns: # Only process standard_columns for numeric conversion
+            if col in raw.columns: # Ensure the column exists before attempting conversion
+                raw[col] = pd.to_numeric(raw[col].astype(str).str.replace(",", ""), errors="coerce")
+
+        dfc = raw.dropna(subset=["STRIKE"]).copy()
+
+        # Reshape to long format
+        calls = dfc.rename(columns={
+            "CALL_OI": "oi", "CALL_CHNG_OI": "change_oi", "CALL_VOLUME": "volume",
+            "CALL_IV": "iv_pct", "CALL_LTP": "ltp", "CALL_BID_QTY": "bid_qty",
+            "CALL_BID": "bid", "CALL_ASK": "ask", "CALL_ASK_QTY": "ask_qty",
+            "STRIKE": "strike"
+        })
+        calls["option_type"] = "call"
+
+        puts = dfc.rename(columns={
+            "PUT_OI": "oi", "PUT_CHNG_OI": "change_oi", "PUT_VOLUME": "volume",
+            "PUT_IV": "iv_pct", "PUT_LTP": "ltp", "PUT_BID_QTY": "bid_qty",
+            "PUT_BID": "bid", "PUT_ASK": "ask", "PUT_ASK_QTY": "ask_qty",
+            "STRIKE": "strike"
+        })
+        puts["option_type"] = "put"
+
+        df = pd.concat([
+            calls[["option_type","strike","oi","change_oi","volume","iv_pct","ltp","bid_qty","bid","ask","ask_qty"]],
+            puts[["option_type","strike","oi","change_oi","volume","iv_pct","ltp","bid_qty","bid","ask","ask_qty"]]
+        ], ignore_index=True)
+
+        df["iv"] = pd.to_numeric(df["iv_pct"], errors="coerce") / 100.0
+
+        print(f"✓ Successfully loaded {len(df)} option records from CSV")
+        return df
+
+    except Exception as e:
+        print(f"❌ Error loading CSV: {e}")
+        print("Please ensure CSV is in NSE format (download from NSE website)")
+        return None
+
+# =========================
+# Greeks computation
+# =========================
+def add_greeks(df: pd.DataFrame, spot: float, expiry_date: str, rfr: float = 0.06) -> Tuple[pd.DataFrame, float]:
+    """
+    Add Greeks columns to options DataFrame
+    """
+    if "expiry_dt" in df.columns and df["expiry_dt"].notna().any():
+        expiry = df["expiry_dt"].iloc[0].date()
+    else:
+        expiry = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+
+    T = max((expiry - datetime.today().date()).days, 0) / 365.0
+
+    greeks = []
+    for _, row in df.iterrows():
+        K = float(row["strike"])
+        sigma = float(row["iv"]) if pd.notna(row["iv"]) else np.nan
+        opt = row["option_type"]
+
+        if pd.isna(sigma) or sigma <= 0 or T <= 0:
+            greeks.append((np.nan, np.nan, np.nan, np.nan, np.nan, np.nan))
+            continue
+
+        delta = bs_delta(spot, K, T, rfr, sigma, opt)
+        gamma = bs_gamma(spot, K, T, rfr, sigma)
+        vega = bs_vega(spot, K, T, rfr, sigma) / 100.0
+        theta_y = bs_theta(spot, K, T, rfr, sigma, opt)
+        theta_d = theta_y / 365.0
+        theo_price = bs_price(spot, K, T, rfr, sigma, opt)
+        greeks.append((delta, gamma, vega, theta_y, theta_d, theo_price))
+
+    df[["delta","gamma","vega","theta_y","theta_d","theo_price"]] = pd.DataFrame(greeks, index=df.index)
+    return df, T
+
+# =========================
+# Enhanced Market Analysis
+# =========================
+def analyze_market_regime(df: pd.DataFrame, spot: float) -> Dict:
+    """
+    Comprehensive market regime analysis with all factors
+    """
+    call_mask = df["option_type"] == "call"
+    put_mask = df["option_type"] == "put"
+
+    # PCR ratios
+    total_call_oi = df.loc[call_mask, "oi"].sum()
+    total_put_oi = df.loc[put_mask, "oi"].sum()
+    total_call_vol = df.loc[call_mask, "volume"].sum()
+    total_put_vol = df.loc[put_mask, "volume"].sum()
+
+    pcr_oi = total_put_oi / max(total_call_oi, 1)
+    pcr_vol = total_put_vol / max(total_call_vol, 1)
+
+    # OI analysis by strike
+    call_oi_by_strike = df.loc[call_mask].groupby("strike")["oi"].sum().sort_values(ascending=False)
+    put_oi_by_strike = df.loc[put_mask].groupby("strike")["oi"].sum().sort_values(ascending=False)
+
+    call_wall = call_oi_by_strike.index[0] if len(call_oi_by_strike) > 0 else spot * 1.05
+    put_floor = put_oi_by_strike.index[0] if len(put_oi_by_strike) > 0 else spot * 0.95
+
+    # Change in OI
+    call_build_by_strike = df.loc[call_mask].groupby("strike")["change_oi"].sum().sort_values(ascending=False)
+    put_build_by_strike = df.loc[put_mask].groupby("strike")["change_oi"].sum().sort_values(ascending=False)
+
+    max_call_build = call_build_by_strike.iloc[0] if len(call_build_by_strike) > 0 else 0
+    max_put_build = put_build_by_strike.iloc[0] if len(put_build_by_strike) > 0 else 0
+
+    # IV Analysis
+    dfm = df.copy()
+    dfm["moneyness"] = dfm["strike"] / spot
+
+    # ATM (0.99 to 1.01)
+    atm_band = dfm[(dfm["moneyness"] >= 0.99) & (dfm["moneyness"] <= 1.01)]
+    atm_call_iv = atm_band.loc[atm_band["option_type"]=="call", "iv_pct"].mean()
+    atm_put_iv = atm_band.loc[atm_band["option_type"]=="put", "iv_pct"].mean()
+    atm_iv = np.nanmean([atm_call_iv, atm_put_iv])
+
+    # OTM options
+    otm_calls = dfm[(dfm["moneyness"] > 1.03) & (dfm["option_type"] == "call")]
+    otm_puts = dfm[(dfm["moneyness"] < 0.97) & (dfm["option_type"] == "put")]
+
+    otm_call_iv = otm_calls["iv_pct"].mean()
+    otm_put_iv = otm_puts["iv_pct"].mean()
+
+    # Spot position
+    spot_position = (spot - put_floor) / max((call_wall - put_floor), 1)
+
+    # Market regime
+    regime = "Neutral"
+    if spot_position > 0.6:
+        regime = "Bullish"
+    elif spot_position < 0.4:
+        regime = "Bearish"
+
+    # Volatility state
+    vol_state = "Normal"
+    if atm_iv > 25: # Example threshold
+        vol_state = "High"
+    elif atm_iv < 12: # Example threshold
+        vol_state = "Low"
+
+    return {
+        "regime": regime,
+        "spot_position": spot_position,
+        "vol_state": vol_state,
+        "pcr_oi": pcr_oi,
+        "pcr_vol": pcr_vol,
+        "call_wall": call_wall,
+        "put_floor": put_floor,
+        "max_call_build": max_call_build,
+        "max_put_build": max_put_build,
+        "atm_iv": atm_iv,
+        "atm_call_iv": atm_call_iv,
+        "atm_put_iv": atm_put_iv,
+        "otm_call_iv": otm_call_iv,
+        "otm_put_iv": otm_put_iv,
+        "call_oi_top5": call_oi_by_strike.head(5).to_dict(),
+        "put_oi_top5": put_oi_by_strike.head(5).to_dict(),
+        "call_build_top5": call_build_by_strike.head(5).to_dict(),
+        "put_build_top5": put_build_by_strike.head(5).to_dict(),
+        "total_call_oi": total_call_oi,
+        "total_put_oi": total_put_oi,
+        "total_call_vol": total_call_vol,
+        "total_put_vol": total_put_vol
+    }
+
+# =========================
+# Strategy Scoring Engine
+# =========================
+def score_strategies(market_analysis: Dict, spot: float, days_to_expiry: int) -> List[Dict]:
+    """
+    Multi-factor scoring for naked option strategies
+    """
+    strategies = []
+
+    regime = market_analysis["regime"]
+    vol_state = market_analysis["vol_state"]
+    pcr_oi = market_analysis["pcr_oi"]
+    spot_position = market_analysis["spot_position"]
+    atm_iv = market_analysis["atm_iv"]
+    otm_call_iv = market_analysis["otm_call_iv"]
+    otm_put_iv = market_analysis["otm_put_iv"]
+    call_wall = market_analysis["call_wall"]
+    put_floor = market_analysis["put_floor"]
+
+    iv_skew_call = ((otm_call_iv - atm_iv) / atm_iv * 100) if not np.isnan(otm_call_iv) and atm_iv > 0 else 0
+    iv_skew_put = ((otm_put_iv - atm_iv) / atm_iv * 100) if not np.isnan(otm_put_iv) and atm_iv > 0 else 0
+
+    # === STRATEGY 1: Naked Put Selling ===
+    put_score = 0
+    put_reasons = []
+    put_risks = []
+
+    if regime == "Bullish":
+        put_score += 30
+        put_reasons.append("✓ Bullish market regime favors put selling")
+    elif regime == "Neutral":
+        put_score += 15
+        put_reasons.append("~ Neutral regime - moderate put selling opportunity")
+
+    if pcr_oi > 1.3:
+        put_score += 25
+        put_reasons.append("✓ Very high PCR (>1.3) - strong put-side protection demand")
+    elif pcr_oi > 1.0:
+        put_score += 15
+        put_reasons.append("✓ High PCR - put-side protection demand")
+
+    if market_analysis["max_put_build"] > market_analysis["max_call_build"] * 1.2:
+        put_score += 20
+        put_reasons.append("✓ Strong fresh put OI building")
+
+    if vol_state == "High":
+        put_score += 15
+        put_reasons.append("✓ High IV environment - premium collection favorable")
+        put_risks.append("⚠ High IV = increased gap risk")
+
+    if iv_skew_put > 10:
+        put_score += 10
+        put_reasons.append("✓ Elevated put IV skew - better risk/reward on OTM puts")
+
+    if spot_position < 0.3:
+        put_risks.append("⚠ Spot very close to put floor - limited downside cushion")
+    if days_to_expiry < 5:
+        put_risks.append("⚠ Very short DTE - rapid gamma acceleration risk")
+
+    strategies.append({
+        "name": "Naked Put Selling",
+        "score": min(put_score, 100),
+        "suitability": "Highly Suitable" if put_score > 70 else "Suitable" if put_score > 50 else "Marginal",
+        "suggested_strikes": [int(spot * 0.99), int(spot * 0.97), int(spot * 0.95)],
+        "reasons": put_reasons,
+        "risks": put_risks if put_risks else ["Standard naked put risks apply"],
+        "target_delta": "0.15-0.25" if days_to_expiry < 7 else "0.20-0.30",
+        "risk_management": [
+            f"Set stop loss at 50-75% of premium collected",
+            f"Avoid strikes with heavy OI concentration",
+            f"Close early if spot breaks {int(put_floor)} decisively",
+            "Monitor PCR shifts - exit if PCR drops below 0.8"
+        ]
+    })
+
+    # === STRATEGY 2: Naked Call Selling ===
+    call_score = 0
+    call_reasons = []
+    call_risks = []
+
+    if regime == "Bearish":
+        call_score += 30
+        call_reasons.append("✓ Bearish market regime favors call selling")
+    elif regime == "Neutral":
+        call_score += 15
+        call_reasons.append("~ Neutral regime - moderate call selling opportunity")
+
+    if pcr_oi < 0.7:
+        call_score += 25
+        call_reasons.append("✓ Very low PCR (<0.7) - strong call-side buildup")
+    elif pcr_oi < 1.0:
+        call_score += 15
+        call_reasons.append("✓ Low PCR - call-side activity dominant")
+
+    if market_analysis["max_call_build"] > market_analysis["max_put_build"] * 1.2:
+        call_score += 20
+        call_reasons.append("✓ Strong fresh call OI building")
+
+    if vol_state == "High":
+        call_score += 15
+        call_reasons.append("✓ High IV environment - premium collection favorable")
+        call_risks.append("⚠ High IV = increased gap risk")
+
+    if iv_skew_call > 10:
+        call_score += 10
+        call_reasons.append("✓ Elevated call IV skew - better risk/reward on OTM calls")
+
+    if spot_position > 0.7:
+        call_risks.append("⚠ Spot very close to call wall - limited upside resistance")
+    if days_to_expiry < 5:
+        call_risks.append("⚠ Very short DTE - rapid gamma acceleration risk")
+
+    strategies.append({
+        "name": "Naked Call Selling",
+        "score": min(call_score, 100),
+        "suitability": "Highly Suitable" if call_score > 70 else "Suitable" if call_score > 50 else "Marginal",
+        "suggested_strikes": [int(spot * 1.01), int(spot * 1.03), int(spot * 1.05)],
+        "reasons": call_reasons,
+        "risks": call_risks if call_risks else ["Standard naked call risks apply"],
+        "target_delta": "0.15-0.25" if days_to_expiry < 7 else "0.20-0.30",
+        "risk_management": [
+            f"Set stop loss at 50-75% of premium collected",
+            f"Avoid strikes with heavy OI concentration",
+            f"Close early if spot breaks {int(call_wall)} decisively",
+            "Monitor PCR shifts - exit if PCR rises above 1.3"
+        ]
+    })
+
+    # === STRATEGY 3: Short Strangle ===
+    strangle_score = 0
+    strangle_reasons = []
+    strangle_risks = []
+
+    if regime == "Neutral" and 0.4 < spot_position < 0.6:
+        strangle_score += 35
+        strangle_reasons.append("✓ Spot well-centered in range - ideal for range strategies")
+    elif 0.35 < spot_position < 0.65:
+        strangle_score += 20
+        strangle_reasons.append("~ Spot reasonably centered for strangle")
+
+    if vol_state == "High":
+        strangle_score += 30
+        strangle_reasons.append("✓ High IV - maximizes premium collection on both sides")
+        strangle_risks.append("⚠ High IV environment increases breakout probability")
+
+    if 5 <= days_to_expiry <= 10:
+        strangle_score += 20
+        strangle_reasons.append("✓ Optimal DTE window for theta decay acceleration")
+    elif days_to_expiry < 5:
+        strangle_risks.append("⚠ Very short DTE - rapid gamma risk on both sides")
+
+    if 0.8 < pcr_oi < 1.2:
+        strangle_score += 15
+        strangle_reasons.append("✓ Balanced PCR - no strong directional bias")
+
+    strangle_risks.append("⚠ Unlimited risk on both sides - requires active monitoring")
+    if iv_skew_call > 15 or iv_skew_put > 15:
+        strangle_risks.append("⚠ Elevated skew indicates tail risk concerns")
+
+    strategies.append({
+        "name": "Short Strangle (Balanced)",
+        "score": min(strangle_score, 100),
+        "suitability": "Highly Suitable" if strangle_score > 70 else "Suitable" if strangle_score > 50 else "Marginal",
+        "suggested_strikes": {
+            "put": int(spot * 0.97),
+            "call": int(spot * 1.03)
+        },
+        "reasons": strangle_reasons,
+        "risks": strangle_risks,
+        "target_delta": "0.15-0.20 each leg",
+        "risk_management": [
+            "Set profit target at 50-60% of max profit",
+            "Close one leg if spot moves 2% in either direction",
+            "Use 2:1 stop loss on total premium collected",
+            "Monitor gamma exposure as expiry approaches",
+            f"Exit if spot breaks {int(put_floor)} or {int(call_wall)}"
+        ]
+    })
+
+    return sorted(strategies, key=lambda x: x["score"], reverse=True)
+
+# =========================
+# Export for Web Analyzer
+# =========================
+def export_for_analyzer(market_analysis: Dict, spot: float, days_to_expiry: int, output_file: str = "strategy_inputs.json") -> Dict:
+    """
+    Export data for web-based Strategy Analyzer
+    """
+    data = {
+        "spot": float(spot),
+        "atmIV": float(market_analysis["atm_iv"]),
+        "pcr_oi": float(market_analysis["pcr_oi"]),
+        "pcr_vol": float(market_analysis["pcr_vol"]),
+        "callWall": float(market_analysis["call_wall"]),
+        "putFloor": float(market_analysis["put_floor"]),
+        "callBuild": float(market_analysis["max_call_build"]),
+        "putBuild": float(market_analysis["max_put_build"]),
+        "otmCallIV": float(market_analysis["otm_call_iv"]),
+        "otmPutIV": float(market_analysis["otm_put_iv"]),
+        "daysToExpiry": int(days_to_expiry)
+    }
+
+    with open(output_file, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    print(f"\n{'='*70}")
+    print(f"✓ Strategy inputs exported to: {output_file}")
+    print(f"{'='*70}")
+    print("\n📋 COPY THIS JSON INTO WEB ANALYZER:")
+    print(json.dumps(data, indent=2))
+
+    return data
+
+# =========================
+# Visualization Functions
+# =========================
+def plot_strategy_dashboard(df: pd.DataFrame, market_analysis: Dict, spot: float):
+    """
+    Create comprehensive visualization dashboard
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Options Strategy Dashboard', fontsize=16, fontweight='bold')
+
+    # 1. OI Profile
+    piv_oi = df.pivot_table(index="strike", columns="option_type", values="oi", aggfunc="sum")
+    ax = axes[0, 0]
+    width = 5 if len(piv_oi) > 50 else 20
+    ax.bar(piv_oi.index, piv_oi.get("call", 0), width=width, label="Call OI", alpha=0.6, color="steelblue")
+    ax.bar(piv_oi.index, piv_oi.get("put", 0), width=width, label="Put OI", alpha=0.6, color="salmon")
+    ax.axvline(spot, color='black', linestyle='--', linewidth=2, label=f'Spot: {spot:.0f}')
+    ax.axvline(market_analysis["call_wall"], color='red', linestyle=':', alpha=0.7, label=f'Call Wall: {market_analysis["call_wall"]:.0f}')
+    ax.axvline(market_analysis["put_floor"], color='green', linestyle=':', alpha=0.7, label=f'Put Floor: {market_analysis["put_floor"]:.0f}')
+    ax.set_title("Open Interest Profile")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("OI")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # 2. Change in OI
+    piv_chg = df.pivot_table(index="strike", columns="option_type", values="change_oi", aggfunc="sum")
+    ax = axes[0, 1]
+    ax.plot(piv_chg.index, piv_chg.get("call", 0), label="Call ΔOI", color="navy", marker="o", markersize=3)
+    ax.plot(piv_chg.index, piv_chg.get("put", 0), label="Put ΔOI", color="darkred", marker="o", markersize=3)
+    ax.axvline(spot, color='black', linestyle='--', linewidth=2)
+    ax.axhline(0, color='gray', linestyle='-', alpha=0.5)
+    ax.set_title("Change in OI (Buildup Analysis)")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("ΔOI")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 3. IV Skew
+    piv_iv = df.pivot_table(index="strike", columns="option_type", values="iv_pct", aggfunc="mean")
+    ax = axes[0, 2]
+    ax.plot(piv_iv.index, piv_iv.get("call", np.nan), label="Call IV (%)", color="steelblue")
+    ax.plot(piv_iv.index, piv_iv.get("put", np.nan), label="Put IV (%)", color="salmon")
+    ax.set_title("IV Skew by Strike")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("Implied Volatility (%)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 4. Greeks: Delta
+    piv_delta = df.pivot_table(index="strike", columns="option_type", values="delta", aggfunc="mean")
+    ax = axes[1, 0]
+    ax.plot(piv_delta.index, piv_delta.get("call", np.nan), label="Call Δ", color="blue")
+    ax.plot(piv_delta.index, piv_delta.get("put", np.nan), label="Put Δ", color="red")
+    ax.set_title("Delta by Strike")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("Delta")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 5. Greeks: Gamma
+    piv_gamma = df.pivot_table(index="strike", columns="option_type", values="gamma", aggfunc="mean")
+    ax = axes[1, 1]
+    ax.plot(piv_gamma.index, piv_gamma.get("call", np.nan), label="Call Γ", color="blue")
+    ax.plot(piv_gamma.index, piv_gamma.get("put", np.nan), label="Put Γ", color="red")
+    ax.set_title("Gamma by Strike")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("Gamma")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 6. Greeks: Theta (Daily)
+    piv_theta = df.pivot_table(index="strike", columns="option_type", values="theta_d", aggfunc="mean")
+    ax = axes[1, 2]
+    ax.plot(piv_theta.index, piv_theta.get("call", np.nan), label="Call Θ/day", color="blue")
+    ax.plot(piv_theta.index, piv_theta.get("put", np.nan), label="Put Θ/day", color="red")
+    ax.set_title("Theta (Daily) by Strike")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("Theta/day")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+def analyze_csv(file_path: str, spot: float, expiry_date: str, rfr: float = 0.06):
+    df = load_nse_option_chain_csv(file_path)
+    if df is None or df.empty:
+        print("❌ No data loaded from CSV. Cannot perform analysis.")
+        return
+
+    # Check if 'expiry_dt' is present and valid; otherwise, try to derive it or use a default
+    if 'expiry_dt' not in df.columns or df['expiry_dt'].isna().all():
+        try:
+            df['expiry_dt'] = pd.to_datetime(expiry_date)
+            # Filter for options maturing on the specified expiry_date
+            df = df[df['expiry_dt'] == expiry_date] # Ensure the dataframe only contains the relevant expiry
+        except Exception as e:
+            print(f"Warning: Could not parse expiry_date from input or DataFrame: {e}. Using current date for T calculation if needed.")
+            # If parsing fails, and no expiry_dt in df, T calculation might be inaccurate.
+
+    # Ensure only one unique expiry date for Greeks calculation or handle multiple expiries
+    unique_expiries = df['expiry_dt'].dropna().unique()
+    if len(unique_expiries) > 1:
+        print("Warning: Multiple expiry dates found in data. Analyzing for the earliest expiry.")
+        # For simplicity, filter for the earliest expiry if multiple are present after loading.
+        earliest_expiry = pd.to_datetime(unique_expiries).min()
+        df = df[df['expiry_dt'] == earliest_expiry].copy()
+        effective_expiry_date = earliest_expiry.strftime("%Y-%m-%d")
+    elif len(unique_expiries) == 1:
+        effective_expiry_date = pd.to_datetime(unique_expiries[0]).strftime("%Y-%m-%d")
+    else:
+        effective_expiry_date = expiry_date # Fallback to user provided expiry_date if none in df
+
+    df_greeks, T = add_greeks(df, spot, effective_expiry_date, rfr=rfr)
+    summary = analyze_market_regime(df_greeks, spot)
+
+    print(f"File: {file_path} | Spot: {spot:.2f} | Days to expiry: {T*365:.0f}")
+    print(f"PCR(OI): {summary['pcr_oi']:.2f} | PCR(Vol): {summary['pcr_vol']:.2f}")
+    print(f"Call Wall: {summary['call_wall']:.0f} | Put Floor: {summary['put_floor']:.0f}")
+    print(f"ATM IV: {summary['atm_iv']:.2f}%")
+    print("\nTop Call OI:\n", pd.Series(summary["call_oi_top5"]).rename("OI"))
+    print("\nTop Put OI:\n", pd.Series(summary["put_oi_top5"]).rename("OI"))
+    print("\nLargest Call ΔOI:\n", pd.Series(summary["call_build_top5"]).rename("ΔOI"))
+    print("\nLargest Put ΔOI:\n", pd.Series(summary["put_build_top5"]).rename("ΔOI"))
+
+    plot_strategy_dashboard(df_greeks, summary, spot)
+
+    strategies = score_strategies(summary, spot, int(T*365))
+    print("\n\n💡 Recommended Strategies:")
+    for s in strategies:
+        print(f"  - {s['name']} (Score: {s['score']}, Suitability: {s['suitability']})")
+        for r in s['reasons']: print(f"    {r}")
+        if s['risks']: print(f"    Risks: {', '.join(s['risks'])}")
+        if s['name'] == 'Short Strangle (Balanced)':
+            print(f"    Suggested Strikes: Put @ {s['suggested_strikes']['put']}, Call @ {s['suggested_strikes']['call']}")
+        else:
+            print(f"    Suggested Strikes: {', '.join(map(str, s['suggested_strikes']))}")
+        print(f"    Target Delta: {s['target_delta']}")
+        print("    Risk Management:")
+        for rm in s['risk_management']: print(f"      - {rm}")
+        print("\n")
+
+    export_for_analyzer(summary, spot, int(T*365))
+
+# Example usage:
+# analyze_live("NIFTY", rfr=0.06)
+# analyze_csv("option-chain-ED-NIFTY-02-Dec-2025.csv", spot=26450.0, expiry_date="2025-12-04", rfr=0.06)
 
 
 # =========================
