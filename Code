@@ -1,0 +1,46 @@
+
+
+# =========================
+# MAIN EXECUTION
+# =========================
+if __name__ == "__main__":
+    # --- CONFIG ---
+    file_path = "/content/option-chain-ED-NIFTY-06-Jan-2026.csv"  # update path
+    spot = 26250.0   # set current spot price
+    expiry_date = "2026-01-06"  # set correct expiry date
+    rfr = 0.06       # risk-free rate
+
+    # --- LOAD DATA ---
+    df = load_nse_option_chain_csv(file_path)
+    if df is None:
+        raise SystemExit("Failed to load option chain CSV")
+
+    # --- ADD GREEKS ---
+    df_greeks, T = add_greeks(df, spot, expiry_date, rfr)
+    days_to_expiry = int(T * 365)
+
+    # --- MARKET ANALYSIS ---
+    market_analysis = analyze_market_regime(df_greeks, spot)
+
+    # --- STRATEGY SCORING ---
+    strategies = score_strategies(market_analysis, spot, days_to_expiry)
+
+    # --- EXPORT JSON ---
+    export_for_analyzer(market_analysis, spot, days_to_expiry, output_file="strategy_inputs.json")
+
+    # --- VISUAL DASHBOARD ---
+    plot_strategy_dashboard(df_greeks, market_analysis, spot)
+
+    # --- PRINT SUMMARY ---
+    print("\nMarket Regime:", market_analysis["regime"])
+    print("Volatility State:", market_analysis["vol_state"])
+    print("PCR(OI):", round(market_analysis["pcr_oi"], 2))
+    print("PCR(Vol):", round(market_analysis["pcr_vol"], 2))
+    print("Call Wall:", market_analysis["call_wall"])
+    print("Put Floor:", market_analysis["put_floor"])
+    print("\nTop Strategies:")
+    for s in strategies:
+        print(f"- {s['name']} | Score: {s['score']} | Suitability: {s['suitability']}")
+        print("  Reasons:", "; ".join(s['reasons']))
+        print("  Risks:", "; ".join(s['risks']))
+        print()
