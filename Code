@@ -11,9 +11,9 @@ warnings.filterwarnings('ignore')
 
 plt.style.use("seaborn-v0_8")
 
-# =========================
+
 # Black–Scholes Greeks
-# =========================
+
 def bs_d1_d2(S, K, T, r, sigma):
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
         return np.nan, np.nan
